@@ -1,7 +1,8 @@
 flask
-gunicorn
 requests
-razorpay
-python-dotenv
+gunicorn
 setuptools
+python-dotenv
+razorpay
+
 
