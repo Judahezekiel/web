@@ -1,102 +1,99 @@
-from flask import Flask, request, jsonify
-import requests
 import os
 import json
+import uuid
+import razorpay
+import requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-WHATSAPP_API_URL = "https://graph.facebook.com/v19.0/YOUR_PHONE_NUMBER_ID/messages"
-ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")  # from .env
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")  # for webhook setup
+# Configuration
+WHATSAPP_API_URL = "https://graph.facebook.com/v19.0/744771188719813/messages"
+ACCESS_TOKEN = os.getenv("EAAKqFTeha2oBPIVGfReqcdwGTrRN5lbWpD3j6SZBWkDreE4c8Lnr0DG8OippMugpA1ZBLZCUeJWGVNODDE8OVGNZAyORJzAHBXZCUeZBXAHPQm37ZAqIHOn3nsUejf4SmSNbbt6jIzFTK1RXZASOPg0loQFryLhBaGZAlWBzWNwOcZCgdc5bSDK2bODUtgeoZAT6vpOQRXRlok7AZA9pc43JwIWb6haZAEDd5A11qu0dDQYZBNRw4KOwZDZD")
+VERIFY_TOKEN = os.getenv("PrintWalla")
 RAZORPAY_API_KEY = os.getenv("RAZORPAY_API_KEY")
 RAZORPAY_API_SECRET = os.getenv("RAZORPAY_API_SECRET")
 QR_CODE_LINK = "https://api.razorpay.com/v1/payment_links"
 
-user_data = {}
-print_queue = []
+# Razorpay client
+razorpay_client = razorpay.Client(auth=(RAZORPAY_API_KEY, RAZORPAY_API_SECRET))
 
-# Verify webhook
-@app.route("/webhook", methods=["GET"])
-def verify():
-    if request.args.get("hub.mode") == "subscribe" and request.args.get("hub.verify_token") == VERIFY_TOKEN:
-        return request.args.get("hub.challenge"), 200
-    return "Unauthorized", 403
+# Temporary in-memory storage (replace with database for production)
+orders = {}
 
-@app.route("/webhook", methods=["POST"])
+# Webhook verification for WhatsApp
+@app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    data = request.get_json()
-    print(json.dumps(data, indent=2))
+    if request.method == "GET":
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+        if mode == "subscribe" and token == VERIFY_TOKEN:
+            return challenge, 200
+        return "Verification failed", 403
 
-    if "messages" in data.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {}):
-        message = data["entry"][0]["changes"][0]["value"]["messages"][0]
-        sender = message["from"]
-        msg_text = message.get("text", {}).get("body", "").lower()
+    if request.method == "POST":
+        data = request.get_json()
+        try:
+            phone_number = data["entry"][0]["changes"][0]["value"]["messages"][0]["from"]
+            send_payment_link(phone_number)
+        except Exception as e:
+            print("Webhook processing error:", e)
+        return "EVENT_RECEIVED", 200
 
-        if sender not in user_data:
-            user_data[sender] = {}
-
-        if msg_text.startswith("hi"):
-            send_whatsapp_message(sender, "👋 Hi! Send your Room No. (e.g. 1105)")
-
-        elif msg_text.isdigit() and len(msg_text) in [3, 4]:
-            user_data[sender]["room"] = msg_text
-            send_whatsapp_message(sender, "How many black & white pages? ₹2 per page")
-
-        elif msg_text.isdigit():
-            user_data[sender]["pages"] = int(msg_text)
-            total = user_data[sender]["pages"] * 2
-            if total >= 50:
-                discount = total * 0.1
-                total -= discount
-            user_data[sender]["amount"] = round(total)
-
-            # Create QR
-            qr = create_payment_qr(sender, user_data[sender]["amount"])
-            send_whatsapp_message(sender, f"Please scan to pay ₹{user_data[sender]['amount']}:")
-            send_whatsapp_image(sender, qr)
-            send_whatsapp_message(sender, "After payment, send the file to print 📄")
-
-        elif "document" in message:
-            filename = message["document"]["filename"]
-            user_data[sender]["file"] = filename
-            print_queue.append((user_data[sender]["room"], filename))
-            print_queue.sort()
-            send_whatsapp_message(sender, f"✅ File '{filename}' received and added to queue. We will print soon.")
-
-    return "ok", 200
-
-def send_whatsapp_message(to, text):
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": text},
-    }
-    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
-    requests.post(WHATSAPP_API_URL, headers=headers, json=payload)
-
-def send_whatsapp_image(to, image_url):
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "image",
-        "image": {"link": image_url},
-    }
-    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
-    requests.post(WHATSAPP_API_URL, headers=headers, json=payload)
-
-def create_payment_qr(phone_number, amount):
-    payload = {
-        "amount": amount * 100,
+# Send payment link via WhatsApp
+def send_payment_link(phone_number):
+    order_id = str(uuid.uuid4())  # Unique order ID per customer
+    amount = 5000  # Amount in paise (₹50)
+    payment_link = razorpay_client.payment_link.create({
+        "amount": amount,
         "currency": "INR",
-        "description": f"Print Payment for {phone_number}",
-        "customer": {"contact": phone_number[-10:]},
-        "notify": {"sms": False, "email": False},
-        "callback_url": "https://yourdomain.com/payment-callback",
+        "description": f"Payment for Order {order_id}",
+        "customer": {"contact": phone_number, "name": "Customer"},
+        "callback_url": "https://web-wn9p.onrender.com/payment-success",
         "callback_method": "get"
+    })
+
+    orders[order_id] = {"phone_number": phone_number, "payment_id": None, "status": "pending"}
+
+    message_data = {
+        "messaging_product": "whatsapp",
+        "to": phone_number,
+        "type": "text",
+        "text": {"body": f"Please complete your payment here: {payment_link['short_url']}"}
     }
-    response = requests.post(QR_CODE_LINK, auth=(RAZORPAY_API_KEY, RAZORPAY_API_SECRET), json=payload)
-    return response.json()["short_url"]
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+    requests.post(WHATSAPP_API_URL, headers=headers, json=message_data)
+
+# Razorpay webhook to confirm payment
+@app.route("/razorpay-webhook", methods=["POST"])
+def razorpay_webhook():
+    data = request.get_json()
+    try:
+        payment_id = data["payload"]["payment"]["entity"]["id"]
+        order_id = data["payload"]["payment"]["entity"]["notes"].get("order_id")
+        status = data["payload"]["payment"]["entity"]["status"]
+
+        if order_id in orders:
+            orders[order_id]["payment_id"] = payment_id
+            orders[order_id]["status"] = status
+            if status == "captured":
+                send_whatsapp_message(orders[order_id]["phone_number"], "✅ Payment received! Thank you.")
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        print("Webhook error:", e)
+        return jsonify({"error": str(e)}), 400
+
+# Helper: Send message via WhatsApp
+def send_whatsapp_message(phone_number, message):
+    message_data = {
+        "messaging_product": "whatsapp",
+        "to": phone_number,
+        "type": "text",
+        "text": {"body": message}
+    }
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+    requests.post(WHATSAPP_API_URL, headers=headers, json=message_data)
 
 if __name__ == "__main__":
     app.run(debug=True)
