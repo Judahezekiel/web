@@ -3,3 +3,5 @@ gunicorn
 requests
 razorpay
 python-dotenv
+setuptools
+
