@@ -1,10 +1,12 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import os
 import razorpay
 import requests
 import hmac
 import hashlib
 import json
+import qrcode
+from io import BytesIO
 
 app = Flask(__name__)
 
@@ -18,11 +20,12 @@ VERIFY_TOKEN = os.getenv("PrintingWalla")
 # Razorpay client
 razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
-# Store phone-payment mapping temporarily (in-memory, use DB in production)
+# Temporary storage for mapping
 pending_payments = {}
+qr_codes = {}  # order_id -> QR code binary (BytesIO object)
 
 # =========================
-# SEND WHATSAPP MESSAGE
+# WHATSAPP FUNCTIONS
 # =========================
 def send_whatsapp_message(to, text):
     url = f"https://graph.facebook.com/v20.0/{WHATSAPP_PHONE_ID}/messages"
@@ -30,15 +33,29 @@ def send_whatsapp_message(to, text):
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
     }
-    payload = {
+    data = {
         "messaging_product": "whatsapp",
         "to": to,
-        "type": "text",
         "text": {"body": text}
     }
-    response = requests.post(url, headers=headers, json=payload)
-    print(f"[WhatsApp] Sent to {to}: {text}")
-    return response.status_code
+    requests.post(url, headers=headers, json=data)
+
+def send_whatsapp_image(to, image_url, caption="Scan this QR to pay"):
+    url = f"https://graph.facebook.com/v20.0/{WHATSAPP_PHONE_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "image",
+        "image": {
+            "link": image_url,
+            "caption": caption
+        }
+    }
+    requests.post(url, headers=headers, json=data)
 
 # =========================
 # WHATSAPP WEBHOOK
@@ -50,91 +67,93 @@ def whatsapp_webhook():
             return request.args.get("hub.challenge")
         return "Invalid verification token", 403
 
-    if request.method == "POST":
+    elif request.method == "POST":
         data = request.json
-        print("[Webhook Received]", json.dumps(data, indent=2))
-
         try:
             message = data["entry"][0]["changes"][0]["value"]["messages"][0]
             sender = message["from"]
             text = message["text"]["body"].strip().lower()
 
             if text == "pay":
-                if sender in pending_payments.values():
-                    send_whatsapp_message(sender, "🕓 You already have a pending payment. Please complete it.")
-                else:
-                    amount = 5000  # in paise (₹50)
-                    order = razorpay_client.order.create({
-                        "amount": amount,
-                        "currency": "INR",
-                        "payment_capture": 1
-                    })
-                    pending_payments[order["id"]] = sender
-                    payment_url = f"https://rzp.io/i/{order['id']}"
-                    send_whatsapp_message(sender, f"💳 Click to pay ₹50: {payment_url}")
+                order_amount = 5000  # ₹50.00 in paise
+                order = razorpay_client.order.create({
+                    "amount": order_amount,
+                    "currency": "INR",
+                    "payment_capture": 1
+                })
 
-            elif text == "help":
-                send_whatsapp_message(sender, "💬 Commands:\n- Type `pay` to get payment link\n- Type `status` to check payment")
+                order_id = order["id"]
+                payment_link = f"https://rzp.io/i/{order_id}"
 
-            elif text == "status":
-                matching = [k for k, v in pending_payments.items() if v == sender]
-                if matching:
-                    send_whatsapp_message(sender, "💡 Your payment is still pending. Please complete it.")
-                else:
-                    send_whatsapp_message(sender, "✅ No pending payments found.")
+                # Save user phone for follow-up
+                pending_payments[order_id] = sender
+
+                # Generate QR Code
+                qr = qrcode.make(payment_link)
+                buffer = BytesIO()
+                qr.save(buffer, format="PNG")
+                buffer.seek(0)
+                qr_codes[order_id] = buffer
+
+                # Send messages
+                send_whatsapp_message(sender, f"Please complete your payment: {payment_link}")
+                send_whatsapp_message(sender, f"Or scan the QR code below 👇")
+
+                # Hosting the QR via dynamic endpoint
+                send_whatsapp_image(sender, f"{request.url_root}qr/{order_id}")
 
             else:
-                send_whatsapp_message(sender, "👋 Hi there! Type `pay` to start payment.")
-
+                send_whatsapp_message(sender, "Hi! Send 'pay' to get a payment link and QR code.")
         except Exception as e:
-            print("❌ Error:", e)
+            print("Error handling message:", e)
 
         return "EVENT_RECEIVED", 200
 
 # =========================
-# RAZORPAY PAYMENT WEBHOOK
+# QR CODE IMAGE ENDPOINT
+# =========================
+@app.route("/qr/<order_id>")
+def serve_qr(order_id):
+    qr_buffer = qr_codes.get(order_id)
+    if not qr_buffer:
+        return "QR code not found", 404
+    return send_file(qr_buffer, mimetype="image/png")
+
+# =========================
+# RAZORPAY WEBHOOK
 # =========================
 @app.route("/payment_webhook", methods=["POST"])
 def payment_webhook():
     payload = request.data
-    received_signature = request.headers.get("X-Razorpay-Signature")
-    webhook_secret = RAZORPAY_KEY_SECRET  # Use a separate webhook secret in production
+    signature = request.headers.get("X-Razorpay-Signature")
+    webhook_secret = RAZORPAY_KEY_SECRET
 
-    # Verify signature
     try:
         hmac_obj = hmac.new(webhook_secret.encode(), payload, hashlib.sha256)
         expected_signature = hmac_obj.hexdigest()
-
-        if not hmac.compare_digest(received_signature, expected_signature):
-            print("❌ Invalid signature")
+        if not hmac.compare_digest(expected_signature, signature):
             return "Invalid signature", 400
-
     except Exception as e:
-        print("❌ Signature error:", e)
-        return "Signature error", 400
+        print("Webhook verification failed:", e)
+        return "Error", 400
 
-    # Process payment event
-    event = json.loads(payload)
-    if event.get("event") == "payment.captured":
-        payment = event["payload"]["payment"]["entity"]
-        order_id = payment.get("order_id")
-        customer = pending_payments.get(order_id)
-
-        if customer:
-            send_whatsapp_message(customer, f"✅ Payment received of ₹{int(payment['amount'])/100:.2f}! Thank you.")
+    data = json.loads(payload)
+    if data.get("event") == "payment.captured":
+        order_id = data["payload"]["payment"]["entity"]["order_id"]
+        customer_number = pending_payments.get(order_id)
+        if customer_number:
+            send_whatsapp_message(customer_number, "✅ Payment received! Thank you.")
             del pending_payments[order_id]
+            qr_codes.pop(order_id, None)
 
-    return jsonify({"status": "success"}), 200
+    return jsonify({"status": "ok"}), 200
 
 # =========================
-# DEFAULT ROUTE
+# ROOT ENDPOINT
 # =========================
 @app.route("/")
-def root():
-    return "✅ WhatsApp + Razorpay App is running!", 200
+def home():
+    return "✅ WhatsApp + Razorpay Bot with QR Code is running!", 200
 
-# =========================
-# MAIN
-# =========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
